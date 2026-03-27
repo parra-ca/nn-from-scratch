@@ -1,0 +1,15 @@
+name: torch-xpu
+channels:
+  - conda-forge
+dependencies:
+  - python=3.13
+  - pip
+  - numpy=2.3
+  - matplotlib
+  - pip:
+      - --index-url https://download.pytorch.org/whl/xpu
+      - torch==2.10.0+xpu
+      - torchvision==0.25.0+xpu
+      - torchaudio==2.10.0+xpu
+      - --extra-index-url https://pypi.org/simple
+      - kornia
