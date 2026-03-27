@@ -150,6 +150,15 @@ y = x.cpu()
 print("x.cpu().item() =", y.item())
 ```
 
+The output should look something like this (the last number is random)
+``` text
+torch         : 2.10.0+xpu
+xpu available : True
+device        : Intel(R) Graphics [0xe212]
+mem_get_info  : (9370324992, 16241180672)
+x.cpu().item() = 2.148054838180542
+```
+
 ---
 
 ## Running
