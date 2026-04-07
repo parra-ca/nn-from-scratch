@@ -1,0 +1,8 @@
+name: numpy-env
+channels:
+  - conda-forge
+dependencies:
+  - python=3.13
+  - pip
+  - numpy=2.3
+
