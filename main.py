@@ -2,11 +2,10 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from typing import Any
 
-import pickle
-import gzip
+import pickle, gzip, math, torch
+_MINI_DATASET_SIZE = 100
 
-import math
-import torch
+torch.set_printoptions(precision=3, sci_mode=False, linewidth=512)
 
 # Activation and activation prime functions
 def sigmoid(z: torch.Tensor, out: torch.Tensor):
@@ -29,22 +28,15 @@ def linear_prime(a: torch.Tensor, z: None, out: torch.Tensor):
     # out = 1
     out.fill_(1.0)
     return
-
 # Decision and decision inverse functions
-def flatten(a: torch.Tensor) -> torch.Tensor: # previously called "identity"
+def flatten(a: torch.Tensor) -> torch.Tensor:
     return a.ravel()
 def argmax(a: torch.Tensor) -> torch.Tensor: 
-    return torch.argmax(a)
-def argmax_inv(y: torch.Tensor, out: torch.Tensor) -> None:
-    out.fill_(0.0)
-    out[y] = 1.0
+    return torch.argmax(a, dim=1, keepdim=True)
+def argmax_inv(y: torch.Tensor, out: torch.Tensor):
+    out.zero_()
+    out.scatter_(dim=1, index=y, value=1.0)
     return
-# Equality tests functions
-def equal_float(y_hat: torch.Tensor, y: torch.Tensor) -> bool:
-    return torch.allclose(y_hat, y, atol=1e-6)
-def equal_int(y_hat: torch.Tensor, y: torch.Tensor) -> bool:
-    return torch.equal(y_hat, y)
-
 # Cost and cost derivative functions
 def mse(y_hat: torch.Tensor, y: torch.Tensor,
         tmp: torch.Tensor) -> torch.Tensor:
@@ -66,7 +58,6 @@ funcs = {
     "loss_prime": mse_prime,
     "decision": argmax,
     "decision_inv": argmax_inv,
-    "equal": equal_int
 }
 
 
@@ -81,26 +72,117 @@ class MnistLoader(object):
         u.encoding = 'latin1'
         self.tr_d, self.va_d, self.te_d = u.load()
         f.close()
-        self.flatten_data(device)
+        self.flatten_data(torch.device(device))
 
     def flatten_data(self, device):
         for dname in ("tr_d", "va_d", "te_d"):
             X,Y = getattr(self, dname)
-            X_t = torch.stack([torch.as_tensor(x, dtype=torch.float32) for x in X])
-            X_t = X_t.reshape(X_t.shape[0], -1, 1).to(device=device)
-            Y_t = torch.as_tensor(Y, dtype=torch.int16, device=device)
-            setattr(self, dname, list(zip(X_t, Y_t)))
+            X_tensor = torch.tensor(X, dtype=torch.float32, device=device)
+            Y_tensor = torch.tensor(Y, dtype=torch.int32, device=device).reshape(-1,1)
+            setattr(self, dname, (X_tensor, Y_tensor))
+
+        # alternative memory blocks for data shuffling
+        self.tr_d_alt_X = torch.empty_like(self.tr_d[0])
+        self.tr_d_alt_Y = torch.empty_like(self.tr_d[1])
         return
 
+    def shuffle_training_data(self):
+        # tr_d --> shuffle --> tr_d_alt
+        X, Y = self.tr_d
+        rand_indices = torch.randperm(X.shape[0], device=X.device)
+        torch.index_select(X, dim=0, index=rand_indices, out=self.tr_d_alt_X)
+        torch.index_select(Y, dim=0, index=rand_indices, out=self.tr_d_alt_Y)
+
+        # flip pointers so that tr_d has the shuffled data
+        tmp_tr = self.tr_d
+        self.tr_d = (self.tr_d_alt_X, self.tr_d_alt_Y)
+        self.tr_d_alt_X = tmp_tr[0]
+        self.tr_d_alt_Y = tmp_tr[1]
+        return
+
+    def mini_sample(self):
+        in_base = 0
+        in_size = 784
+        ds_size = _MINI_DATASET_SIZE
+        self.tr_d = (self.tr_d[0][:ds_size,in_base:in_base+in_size],
+                     self.tr_d[1][:ds_size])
+        self.te_d = (self.te_d[0][:ds_size,in_base:in_base+in_size],
+                     self.te_d[1][:ds_size])
+        self.va_d = (self.va_d[0][:ds_size,in_base:in_base+in_size],
+                     self.va_d[1][:ds_size])
+        self.tr_d_alt_X = torch.empty_like(self.tr_d[0])
+        self.tr_d_alt_Y = torch.empty_like(self.tr_d[1])
+        return
+    
     def describe(self):
         names = ("Training", "Validation", "Test")
         parts = (self.tr_d, self.va_d, self.te_d)
-        for name, part in zip(names, parts):
-            x,y = part[0]
-            print(f"{name:10} ({len(part)} samples):\n"
-                  f"    X:({x.dtype}){x.shape} --> y:({y.dtype}){y.shape}")
+        for name, data_set in zip(names, parts):
+            x,y = data_set
+            xdt, ydt = str(x.dtype), str(y.dtype)
+            print(f"{name}:(X,Y):\n"
+                  f"    X   {xdt:>14}   {list(x.shape)}\n"
+                  f"    Y   {ydt:>14}   {list(y.shape)}")
         return
 
+class Workspace(object):
+    def __init__(
+            self,
+            weights: list[torch.Tensor],
+            batch_size: int,
+            dtype: torch.dtype,
+            device: str | torch.device
+    ):
+        device = torch.device(device)
+        self.batch_sz = batch_size
+        
+        # size of layers. Consider that the first weight is dummy.
+        lys_sz = [weights[1].shape[0]] + [w.shape[1] for w in weights[1:]]
+        max_ly_sz = max(lys_sz)
+        
+        # scratch space to hold intermediate computation:
+        # - layers. Can contain activation (not counting input layer) or
+        #   delta_z (again, not counting the input layer)
+        self.layers = [torch.zeros((batch_size,ly_sz), dtype=dtype,
+                                   device=device)
+                       for ly_sz in lys_sz]
+        
+        # - single layer activation prime
+        # - single layer activation gradient
+        self.a_prime = torch.zeros((batch_size,max_ly_sz), dtype=dtype,
+                                   device=device)
+        self.a_grad  = torch.zeros((batch_size,max_ly_sz), dtype=dtype,
+                                   device=device)
+        
+        # - gradient of Cost wrt all weights
+        # - gradient of Cost wrt all biases
+        self.w_grad = [torch.zeros((0,0), dtype=dtype, device=device)] + \
+            [torch.zeros(w.shape, dtype=dtype, device=device)
+             for w in weights[1:]]
+        self.b_grad = [torch.zeros((0,0), dtype=dtype, device=device)] + \
+            [torch.zeros((1,w.shape[1]), dtype=dtype, device=device)
+             for w in weights[1:]]
+
+        # simple accumulator for the evaluation count
+        self.correct_count = torch.zeros(1, dtype=torch.int64, device=device)
+        return
+    
+    def drop(self):
+        attrs = ["batch_sz", "layers", "a_prime", "a_grad", "w_grad", "b_grad"]
+        for a in attrs:
+            if hasattr(self, a):
+                delattr(self, a)
+        torch.xpu.empty_cache()
+        return
+
+    def drop_train_space(self):
+        attrs = ["batch_sz", "a_prime", "a_grad", "w_grad", "b_grad"]
+        for a in attrs:
+            if hasattr(self, a):
+                delattr(self, a)
+        torch.xpu.empty_cache()
+        return
+    
 class NeuralNetwork(object):
     @classmethod
     def __random_seed(
@@ -115,12 +197,11 @@ class NeuralNetwork(object):
         if torch.device(device).type == "xpu":
             torch.xpu.manual_seed_all(seed)
         return
-    
+     
     def __init__(
             self,
             weights: list[torch.Tensor],
             biases: list[torch.Tensor],
-            layers: list[torch.Tensor],
             funcs: Mapping[str, Callable[..., Any]],
             dtype: torch.dtype,
             device: str | torch.device
@@ -128,14 +209,10 @@ class NeuralNetwork(object):
         # general network attributes
         self.dtype = dtype
         self.device = torch.device(device)
-
-        # network shape
-        for i,ly in enumerate(layers):
-            if ly.ndim != 2 or ly.shape[1] != 1:
-                raise ValueError(f"layers[{i}].shape != (n,1), got {ly.shape}.")
-        net_parts = {"weights":weights,
-                     "biases":biases,
-                     "layers":layers}
+        self.ws: Workspace | None = None
+        
+        # Check correct weights and biases, and store in object
+        net_parts = {"weights":weights, "biases":biases}
         for name,lst in net_parts.items():
             if not isinstance(lst, list):
                 raise TypeError(f"{name} is not a list, got {type(lst)}.")
@@ -148,21 +225,20 @@ class NeuralNetwork(object):
                                     f"got {item.dtype}.")
                 if item.device != self.device:
                     lst[i] = item.to(self.device)
+        for i in range(len(weights)):
+            ws0 = weights[i].shape[1]
+            bs0 = biases[i].shape[1]
+            if ws0 != bs0:
+                raise ValueError(f"Error: weights[{i}].shape[1] == {ws0} != "
+                                 f"biases[{i}].shape[1] == {bs0}")
         self.weights = weights
         self.biases = biases
-        self.layers = layers
-        self.ly_sizes = [ly.shape[0] for ly in self.layers]
-
-        # gradient accumulators
-        self.weights_acc_grad = [torch.zeros_like(w) for w in weights]
-        self.biases_acc_grad = [torch.zeros_like(b) for b in biases]
 
         # user defined activation, loss, decision, and equal functions
         keys = ["hl_activ", "hl_activ_prime",
                 "ol_activ", "ol_activ_prime",
                 "loss", "loss_prime",
-                "decision", "decision_inv",
-                "equal"]
+                "decision", "decision_inv"]
         for k in keys:
             if k not in funcs:
                 raise ValueError(f"Function \"{k}\" expected but not given.")
@@ -170,20 +246,6 @@ class NeuralNetwork(object):
             if not callable(fn):
                 raise ValueError(f"funcs[\"{k}\"] is not callable.")
             setattr(self, f'fn_{k}', fn)
-
-        # scratch space for temporary values
-        max_ly_sz = max(self.ly_sizes)
-        max_W_sz = max(ly*nxt_ly for ly, nxt_ly in
-                       zip(self.ly_sizes[:-1], self.ly_sizes[1:]))
-        # to hold the activation prime
-        self.tmp_a_prime = torch.zeros((max_ly_sz,), dtype=self.dtype,
-                                       device=self.device)
-        # to hold the activation gradient
-        self.tmp_a_grad  = torch.zeros((max_ly_sz,), dtype=self.dtype,
-                                       device=self.device)
-        # to hold the delta of a layer's weights
-        self.tmp_w_grad = torch.zeros((max_W_sz,), dtype=self.dtype,
-                                      device=self.device)
         return
     
     @classmethod
@@ -199,31 +261,17 @@ class NeuralNetwork(object):
         device = torch.device(device)
         cls.__random_seed(device, rand_seed)
         
-        # weights
+        if len(init_weights) != len(init_biases):
+            raise ValueError(f"len(weights) != len(biases)")
+        # weights (prepend a dummy zero to keep easy indices)
         W_list = [torch.as_tensor(w, dtype=dtype, device=device)
                   for w in init_weights]
-        weights = [torch.empty((0,), dtype=dtype, device=device)] + W_list
-
+        weights = [torch.empty((0,0), dtype=dtype, device=device)] + W_list
         # biases
-        b_list = [torch.as_tensor(b, dtype=dtype, device=device).reshape(-1,1)
+        b_list = [torch.as_tensor(b, dtype=dtype, device=device).reshape(1,-1)
                   for b in init_biases]
-        biases = [torch.empty((0,), dtype=dtype, device=device)] + b_list
-        
-        # list of layer sizes
-        ly_sizes = [weights[0].shape[1]] + [w.shape[0] for w in weights]
-
-        # layers
-        layers = [torch.zeros((l_sz,1), dtype=dtype, device=device)
-                  for l_sz in ly_sizes]
-        
-        # check sizes
-        for i in range(1, len(weights)):
-            if weights[i].shape[0] != biases[i].shape[0]:
-                raise ValueError(f"weights[{i}]={str(weights[i].shape)} "
-                                 f"does not match bias[{i}]="
-                                 f"{str(biases[i].shape)}.")
-            
-        return cls(weights, biases, layers, funcs, dtype, device)
+        biases = [torch.empty((0,0), dtype=dtype, device=device)] + b_list
+        return cls(weights, biases, funcs, dtype, device)
     
     @classmethod
     def from_layers(
@@ -235,37 +283,35 @@ class NeuralNetwork(object):
             device: str | torch.device = "xpu"
     ):
         device = torch.device(device)
-        cls.__random_seed(device, rand_seed)        
-        
-        # layers
-        layers = [torch.zeros((ly_sz,1), dtype=dtype, device=device) for ly_sz in ly_sizes]
+        cls.__random_seed(device, rand_seed)
         
         # weights and biases
-        weights = [torch.empty((0,), dtype=dtype, device=device)]
-        biases = [torch.empty((0,), dtype=dtype, device=device)]
+        weights = [torch.empty((0,0), dtype=dtype, device=device)]
+        biases = [torch.empty((0,0), dtype=dtype, device=device)]
         for l_sz, ll_sz in zip(ly_sizes[:-1], ly_sizes[1:]):
             xavier = 1/math.sqrt(l_sz)
-            w = torch.empty((ll_sz,l_sz), dtype=dtype, device=device)\
+            w = torch.empty((l_sz,ll_sz), dtype=dtype, device=device)\
                      .uniform_(-xavier, xavier)
-            b = torch.empty((ll_sz,1), dtype=dtype, device=device)\
+            b = torch.empty((1,ll_sz), dtype=dtype, device=device)\
                      .uniform_(-xavier, xavier)
             weights.append(w)
             biases.append(b)
-        return cls(weights, biases, layers, funcs, dtype, device)
-
+        return cls(weights, biases, funcs, dtype, device)
     
     # These 'fn_' functions are to be replaced in __init__ with the
     # ones provided by the user
     def fn_hl_activ(self, z: torch.Tensor, out: torch.Tensor):
         # activation function of hidden layers
         return
-    def fn_hl_activ_prime(self, a: torch.Tensor, z: torch.Tensor | None, out: torch.Tensor):
+    def fn_hl_activ_prime(self, a: torch.Tensor, z: torch.Tensor | None,
+                          out: torch.Tensor):
         # derivative of activation function of hidden layers
         return
     def fn_ol_activ(self, z: torch.Tensor, out: torch.Tensor):
         # activation function of output layer
         return
-    def fn_ol_activ_prime(self, a: torch.Tensor, z: torch.Tensor | None, out: torch.Tensor):
+    def fn_ol_activ_prime(self, a: torch.Tensor, z: torch.Tensor | None,
+                          out: torch.Tensor):
         # derivative of activation function of output layer
         return
     def fn_decision(self, a: torch.Tensor) -> torch.Tensor:
@@ -274,149 +320,195 @@ class NeuralNetwork(object):
     def fn_decision_inv(self, y: torch.Tensor , out: torch.Tensor) -> None:
         # expresses y as the expected values of the last layer
         return y
-    def fn_equal(self, y_hat: torch.Tensor, y: torch.Tensor) -> bool:
-        # how to determine if they_hat is equal to y
-        return False
-    def fn_loss(self, y_hat: torch.Tensor, y: torch.Tensor, tmp: torch.Tensor) -> float:
+    def fn_loss(self, y_hat: torch.Tensor, y: torch.Tensor,
+                tmp: torch.Tensor) -> float:
         return 0.0
-    def fn_loss_prime(self, y_hat: torch.Tensor, y: torch.Tensor, out: torch.Tensor):
+    def fn_loss_prime(self, y_hat: torch.Tensor, y: torch.Tensor,
+                      out: torch.Tensor):
         # gradient of C with respect to output layer
         return
 
-    def feedforward(self, x: torch.Tensor):
-        # INPUT LAYER: simply assign the input data to this layer
-        self.layers[0].copy_(x)
-
-        # HIDDEN LAYERS: z_l = W_l times a_{l-1}; a_l = activ(z_l)
-        for l in range(1, len(self.ly_sizes)-1):
-            torch.matmul(self.weights[l], self.layers[l-1], out=self.layers[l])
-            self.layers[l].add_(self.biases[l])
-            self.fn_hl_activ(self.layers[l], self.layers[l])
+    def _allocate_train_workspace(self, batch_size: int):
+        if self.ws is not None:
+            self.ws.drop()
+        self.ws = Workspace(self.weights, batch_size, self.dtype, self.device)
+        return
+        
+    def _allocate_prediction_workspace(self):
+        if self.ws is not None:
+            self.ws.drop()
+        self.ws = Workspace(self.weights, 1, self.dtype, self.device)
+        self.ws.drop_train_space()
+        return
+    
+    def _feedforward(self):
+        # assumes the first layer already has the input data in place
+        assert(self.ws is not None)
+        
+        # HIDDEN LAYERS: z_l = a_{l-1} times W_l ; a_l = activ(z_l)
+        for l in range(1, len(self.weights)-1):
+            torch.matmul(self.ws.layers[l-1],
+                         self.weights[l],
+                         out=self.ws.layers[l])
+            self.ws.layers[l].add_(self.biases[l])
+            self.fn_hl_activ(self.ws.layers[l], self.ws.layers[l])
 
         # OUTPUT LAYER: same as hidden layers, but it may have a different
         # activation function
-        torch.matmul(self.weights[-1], self.layers[-2], out=self.layers[-1])
-        self.layers[-1].add_(self.biases[-1])
-        self.fn_ol_activ(self.layers[-1], self.layers[-1])
+        torch.matmul(self.ws.layers[-2],
+                     self.weights[-1],
+                     out=self.ws.layers[-1])
+        self.ws.layers[-1].add_(self.biases[-1])
+        self.fn_ol_activ(self.ws.layers[-1], self.ws.layers[-1])
         return
-    
-    def backprop(self, y: torch.Tensor):
-        # Use the same space that now have the activations to store
-        # the deltas.
 
+    def _backprop(self, y_batch: torch.Tensor):
+        assert(self.ws is not None)
+        batch_sz = y_batch.shape[0]
         # STARTUP:
         # - compute delta_z of output layer
-        out_layer = self.layers[-1]
-        ol_sz = out_layer.shape[0]
-        ol_a_prime = self.tmp_a_prime[:ol_sz].reshape(-1,1)
-        ol_a_grad  = self.tmp_a_grad[:ol_sz].reshape(-1,1)
-        y_as_layer = ol_a_grad 
-        self.fn_decision_inv(y=y, out=y_as_layer)
-        self.fn_ol_activ_prime(a=out_layer, z=None, out=ol_a_prime)
-        self.fn_loss_prime(y_hat=out_layer, y=y_as_layer, out=ol_a_grad)
-        torch.mul(ol_a_prime, ol_a_grad, out=out_layer)
+        out_layer = self.ws.layers[-1]
+        ly_sz = out_layer.shape[1]
+        a_prime = self.ws.a_prime.ravel()[:batch_sz*ly_sz]\
+                                 .reshape(batch_sz,ly_sz)
+        a_grad  = self.ws.a_grad.ravel()[:batch_sz*ly_sz]\
+                                .reshape(batch_sz,ly_sz)
+        y_as_layer = a_grad
+        self.fn_decision_inv(y=y_batch, out=y_as_layer)
+        self.fn_loss_prime(y_hat=out_layer, y=y_as_layer, out=a_grad)
+        self.fn_ol_activ_prime(a=out_layer, z=None, out=a_prime)
+        torch.mul(a_grad, a_prime, out=out_layer)
 
-        # OUTPUT AND ALL BUT FIRST HIDDEN LAYERS:
+        # OUTPUT AND ALL PREVIOUS, BUT FIRST HIDDEN LAYER:
         # - compute gradient of C w.r.t. this layer (tl) weights and biases.
         # - compute delta_z of previous layer (pl) (only hidden layers).
-        lys = len(self.layers)
+        lys = len(self.ws.layers)
         for pl,tl in zip(range(lys-2, -1, -1), range(lys-1, 0, -1)):
-            prev_layer = self.layers[pl]
-            pl_sz = prev_layer.shape[0]
-            #this_layer = self.layers[tl]
-            tl_sz = self.layers[tl].shape[0]
+            # previous layer activation
+            pl_activ = self.ws.layers[pl]
+            pl_activ_sz = pl_activ.shape[1]
+            # this layer delta
+            tl_delta = self.ws.layers[tl]
             
-            # gradient of C w.r.t. this layer biases
-            tl_delta_z = self.layers[tl]
-            acc_b_grad = self.biases_acc_grad[tl]
-            acc_b_grad.add_(tl_delta_z)
+            # gradient of C w.r.t. this layer biases:
+            # - sum of deltas across batch samples
+            tl_b_grad = self.ws.b_grad[tl]
+            torch.sum(tl_delta, dim=0, keepdim=True, out=tl_b_grad)
             
-            # gradient of C w.r.t. this layer weights
-            tl_w_grad = self.tmp_w_grad[:tl_sz*pl_sz].reshape(tl_sz,pl_sz)
-            acc_w_grad = self.weights_acc_grad[tl]
-            torch.matmul(tl_delta_z, prev_layer.T, out=tl_w_grad)
-            acc_w_grad.add_(tl_w_grad)
+            # gradient of C w.r.t. this layer weights:
+            # - matrix multip. of this layer's delta and transposed previous
+            #   layer activations.
+            tl_w_grad = self.ws.w_grad[tl]
+            torch.matmul(pl_activ.T, tl_delta, out=tl_w_grad)
 
-            if pl > 0: # delta_z of previous *hidden* layers only
-                pl_a_prime = self.tmp_a_prime[:pl_sz].reshape(-1,1)
-                pl_a_grad = self.tmp_a_grad[:pl_sz].reshape(-1,1)
+            if pl > 0: # compute delta_z for previous layer only if it is hidden
+                pl_a_prime = self.ws.a_prime.ravel()[:batch_sz*pl_activ_sz]\
+                                            .reshape(batch_sz,pl_activ_sz)
+                pl_a_grad = self.ws.a_grad.ravel()[:batch_sz*pl_activ_sz]\
+                                          .reshape(batch_sz,pl_activ_sz)
                 tl_w = self.weights[tl]
-                self.fn_hl_activ_prime(a=prev_layer, z=None, out=pl_a_prime)
-                torch.matmul(tl_w.T, tl_delta_z, out=pl_a_grad)
-                torch.mul(pl_a_prime, pl_a_grad, out=prev_layer)
+                self.fn_hl_activ_prime(a=pl_activ, z=None, out=pl_a_prime)
+                torch.matmul(tl_delta, tl_w.T, out=pl_a_grad)
+                torch.mul(pl_a_grad, pl_a_prime, out=pl_activ)
         return
     
-    def update_parameters(self, mini_batch_sz: int, learning_rate: float):
-        learn_factor = - learning_rate / mini_batch_sz
-        # self.{weights,biases,..._acc_grad}[0] are dummy.
+    def _update_parameters(self, batch_sz: int, learning_rate: float):
+        assert(self.ws is not None)
+        learn_factor = - learning_rate / batch_sz
+        # index 0 is dummy
         for ly in range(1, len(self.weights)):
+            # update this layer's biases
             b = self.biases[ly]
-            b_gr = self.biases_acc_grad[ly]
+            b_gr = self.ws.b_grad[ly]
             b_gr.mul_(learn_factor)
             b.add_(b_gr)
 
+            # update this layer's weights
             w = self.weights[ly]
-            w_gr = self.weights_acc_grad[ly]
+            w_gr = self.ws.w_grad[ly]
             w_gr.mul_(learn_factor)
             w.add_(w_gr)
         return
-    
-    def evaluate(
-            self,
-            test_data: list[tuple[torch.Tensor, torch.Tensor]]
-    ) -> int:
-        correct_count = torch.zeros((1,), dtype=torch.int64,
-                                     device=self.device)
-        for x,y in test_data:
-            self.feedforward(x)
-            out_layer = self.layers[-1]
-            y_hat = self.fn_decision(out_layer)
-            if self.fn_equal(y_hat, y):
-                correct_count.add_(1)
-        return int(correct_count.item())
 
+    def _evaluate(
+            self,
+            test_data: tuple[torch.Tensor, torch.Tensor]
+    ) -> tuple[int, int]:
+        assert(self.ws is not None)
+        # trim train data to fit an exact number of batches
+        test_full_sz = test_data[0].shape[0]  
+        batch_sz = self.ws.batch_sz
+        test_sz = test_full_sz - (test_full_sz % batch_sz)
+
+        # evaluate in batches
+        X,Y = test_data
+        correct_count = self.ws.correct_count
+        for start_idx in range(0, test_sz, batch_sz):
+            end_idx = start_idx+batch_sz
+
+            self.ws.layers[0].copy_(X[start_idx:end_idx,:])
+            self._feedforward()
+            y_hat_batch = self.fn_decision(self.ws.layers[-1])
+            y_batch = Y[start_idx:end_idx,:]
+            correct_count += torch.sum(y_hat_batch == y_batch, )
+        corr_count = int(correct_count.item())
+        correct_count.zero_()
+        return (corr_count, test_sz)
+    
     def stoc_gradient_descent(
             self,
-            train_data: list[tuple[torch.Tensor,torch.Tensor]],
+            data_source: MnistLoader,
             epochs: int,
-            mini_batch_size: int,
+            batch_sz: int,
             learning_rate: float,
-            test_data: list[tuple[torch.Tensor,torch.Tensor]] | None = None
+            test: bool = False
     ):
-        train_sz = len(train_data)
+        # allocate memory for training
+        self._allocate_train_workspace(batch_sz)
+        assert(self.ws is not None)
+
+        # trim train data to fit an exact number of batches
+        train_full_sz = data_source.tr_d[0].shape[0]  
+        train_sz = train_full_sz - (train_full_sz % batch_sz)
         for epoch in range(epochs):
             print(f"Epoch {(epoch+1):3}: ", end="", flush=True)
-            # randomize samples order
-            rand_idx = torch.randperm(train_sz)
-            train_data = [train_data[i] for i in rand_idx]
-            
-            # do one descent step for each mini-batch
-            for start_idx in range(0, train_sz, mini_batch_size):
-                end_idx = min(start_idx+mini_batch_size, train_sz)
-                # clear all bias and weight gradiant accumulators
-                for b_gr,w_gr in zip(self.biases_acc_grad[1:],
-                                     self.weights_acc_grad[1:]):
-                    b_gr.fill_(0.0)
-                    w_gr.fill_(0.0)
-                # Do forward and backward passes for all samples
-                # in the mini_batch, accumulating the gradients
-                # produced by each sample.
-                for i in range(start_idx, end_idx):
-                    # read a randomized sample
-                    x,y = train_data[i]
-                    self.feedforward(x)
-                    self.backprop(y)
-                self.update_parameters(mini_batch_size, learning_rate)
+
+            # shuffle data before creating the minibatches
+            if epoch != 0:
+                data_source.shuffle_training_data()
+
+            # do one gradient step per mini_batch
+            X,Y = data_source.tr_d
+            for start_idx in range(0, train_sz, batch_sz):
+                end_idx = start_idx+batch_sz # train_sz multiple of batch_sz
+
+                # clear all bias and weight gradient accumulators
+                for b_gr,w_gr in zip(self.ws.b_grad[1:], self.ws.w_grad[1:]):
+                    b_gr.zero_()
+                    w_gr.zero_()
+                
+                # Do forward and backward passes for all samples in the
+                # mini_batch, accumulating the gradients produced by each
+                # sample.
+                self.ws.layers[0].copy_(X[start_idx:end_idx])
+                self._feedforward()
+                self._backprop(Y[start_idx:end_idx])
+                self._update_parameters(batch_sz, learning_rate)
 
             # test how good the network is doing
-            if test_data:
-                perc = 100 * self.evaluate(test_data) / len(test_data)
+            if (test or epoch+1 == epochs) and data_source.te_d is not None:
+                test_data = data_source.te_d
+                correct, total = self._evaluate(test_data) 
+                perc = 100 * correct / total
                 print(f"{perc:6.2f}%")
                 if abs(perc - 100) < 0.0000001:
                     print("good enough!")
                     break
             else:
                 print(f"complete.")
+
+        # Done training. Allocate space to predict only
+        self._allocate_prediction_workspace()
         return
 
     def save_params(self, path:str):
@@ -431,109 +523,149 @@ class NeuralNetwork(object):
     def load_params(cls, path:str):
         payload = torch.load(path, weights_only=True)
         return payload["weights"], payload["biases"]
-    
-    def __str__(self):
+
+    def describe(self, layers=False):
         s = []
-
-        l_parts = []
-        for l in self.layers:
-            l_parts.append(f'{l}\n')
-        l_parts = "\n".join(l_parts)
-
-        w_parts = []
-        for w in self.weights:
-            w_parts.append(f'{w}\n')
+        w_parts = ["\nWEIGHTS:"]
+        for i, w in enumerate(self.weights):
+            ob = w if layers else ''
+            w_parts.append(f'  L{i} {list(w.shape)}\n  {ob}')
         w_parts = "\n".join(w_parts)
+        s.append(w_parts)
         
-        s.extend(["LAYERS:", l_parts])
-        s.extend(["WEIGHTS:", w_parts])
+        b_parts = ["\nBIASES:"]
+        for i,b in enumerate(self.biases):
+            ob = b if layers else ''
+            b_parts.append(f'  L{i} {list(b.shape)}\n  {ob}')
+        b_parts = "\n".join(b_parts)
+        s.append(b_parts)
+
+
+        if self.ws is None:
+            s.append("\nNO WORKSPACE")
+            return "\n".join(s)
+
+        batch_sz = self.ws.batch_sz
+        ws_batch_sz = [f"\nWORKSPACE: BATCH_SZ={batch_sz}"]
+        ws_batch_sz = "\n".join(ws_batch_sz)
+        s.append(ws_batch_sz)
+        
+        ws_activs_parts = ["\nWS.ACTIVS:"]
+        for i, a in enumerate(self.ws.layers):
+            ob = a if layers else ''
+            ws_activs_parts.append(f'  L{i} {list(a.shape)}\n  {ob}')
+        ws_activs_parts = "\n".join(ws_activs_parts)
+        s.append(ws_activs_parts)
+        
+        ws_aprime_parts = ["\nWS.A_PRIME", f"  {list(self.ws.a_prime.shape)}"]
+        ws_agrad_parts = ["\nWS.A_GRAD", f"  {list(self.ws.a_grad.shape)}"]
+        s.extend(ws_aprime_parts)
+        s.extend(ws_agrad_parts)
+        
+        ws_wgrad_parts = ["\nWS.W_GRADS:"]
+        for i, wg in enumerate(self.ws.w_grad):
+            ob = wg if layers else ''
+            ws_wgrad_parts.append(f'  L{i} {list(wg.shape)}\n  {ob}')
+        ws_wgrads_parts = "\n".join(ws_wgrad_parts)
+        s.append(ws_wgrads_parts)
+        
+        ws_bgrad_parts = ["\nWS.B_GRADS:"]
+        for i, bg in enumerate(self.ws.b_grad):
+            ob = bg if layers else ''
+            ws_bgrad_parts.append(f'  L{i} {list(bg.shape)}\n {ob}')
+        ws_bgrads_parts = "\n".join(ws_bgrad_parts)
+        s.append(ws_bgrads_parts)
         
         return "\n".join(s)
-
-    def __repr__(self):
-        s = []
         
-        w_g_parts = []
-        for wg in self.weights_acc_grad:
-            w_g_parts.append(f'{wg}\n')
-        w_g_parts = "\n".join(w_g_parts)
-        
-        b_g_parts = []
-        for bg in self.biases_acc_grad:
-            b_g_parts.append(f'{bg}\n')
-        b_g_parts = "\n".join(b_g_parts)
+    def __str__(self):
+        return self.describe(layers=False)
 
-        t_parts = ["tmp_a_prime:", str(self.tmp_a_prime),
-                   "tmp_a_grad:", str(self.tmp_a_grad),
-                   "tmp_w_grad:", str(self.tmp_w_grad)]
-        t_parts = "\n".join(t_parts)
-        
-        s.extend(["WEIGHTS GRADIENTS:", w_g_parts])
-        s.extend(["BIAS GRADIENTS:", b_g_parts])
-        s.extend(["TEMP_MEMORY:", t_parts])
-        
-        return self.__str__()+"\n"+"\n".join(s)
+def run_sample(nn: NeuralNetwork, train_data, batch_sz: int, samples: int = 100):
+    X, Y = train_data
+    nn._allocate_train_workspace(batch_sz)
+    assert(nn.ws is not None)
+    for start_idx in range(0, samples, batch_sz):
+        end_idx = min(samples, start_idx+batch_sz)
+        nn.ws.layers[0].copy_(X[start_idx:end_idx])
+        nn._feedforward()
+        nn._backprop(Y[start_idx:end_idx])
+        nn._update_parameters(batch_sz, 0.5)
+    return
 
-
-def run_sample(nn: NeuralNetwork, train_data, batch_sz: int, n_samples: int = 100):
-    for start_idx in range(0, n_samples, batch_sz):
-        end_idx = min(n_samples, start_idx+batch_sz)
-        for i in range(start_idx, end_idx):
-            x, y = train_data[i]
-            nn.feedforward(x)
-            nn.backprop(y)
-        nn.update_parameters(batch_sz, 0.5)
-    
-def profile(nn: NeuralNetwork, train_data, batch_size: int, n_samples: int = 100):
+def profile(nn: NeuralNetwork,
+            data_source: MnistLoader,
+            batch_size: int,
+            samples: int):
     print("PROFILING")
     import cProfile
     profiler = cProfile.Profile()
     profiler.enable()
-    run_sample(nn, train_data, batch_sz=batch_size, n_samples=n_samples)
+    run_sample(nn, data_source.tr_d, batch_size, samples)
     profiler.disable()
     profiler.print_stats(sort="tottime")
     exit(0)
 
-def torch_profile(nn: NeuralNetwork, train_data, batch_size: int, n_samples: int = 100):
+def torch_profile(nn: NeuralNetwork,
+                  data_source: MnistLoader,
+                  batch_size: int,
+                  samples: int = 100):
     print("PROFILING")
     with torch.profiler.profile(
         activities=[
             torch.profiler.ProfilerActivity.CPU,
             torch.profiler.ProfilerActivity.XPU,
-        ]
+        ],
+        acc_events=True
     ) as prof:
-        run_sample(nn, train_data, batch_sz=batch_size, n_samples=n_samples)
+        run_sample(nn, data_source.tr_d, batch_size, samples)
     print(prof.key_averages().table(sort_by="self_cpu_time_total", row_limit=20))
     exit(0)
 
-
-def main(data_path: str | None = "mnist.pkl.gz", params_path="mnist_params"):
+def main(data_path: str | None = "mnist.pkl.gz",
+         params_path: str | None = "mnist_params",
+         profile: bool = False):
     print("PROBING SYSTEM")
     print("XPU available?:", torch.xpu.is_available())
 
+    
     print("\nLOADING DATA")
     mnist = MnistLoader(data_path)
-    mnist.describe()
+
     
     print("\nCREATING NETWORK")
-    in_ly_sz = [len(mnist.tr_d[0][0])]
-    hidden_lys = [200,200]
+    in_ly_sz = [mnist.tr_d[0].shape[1]]
+    hidden_lys = [200, 200]
     out_ly_sz = [10]
     all_layers = in_ly_sz + hidden_lys + out_ly_sz
     print("in ->", all_layers, "-> out")
     nn = NeuralNetwork.from_layers(all_layers, funcs)
 
-    # torch_profile(nn, mnist.tr_d, batch_size=20, n_samples=1000)
-
-    print("\nTRAINING")
-    nn.stoc_gradient_descent(
-        train_data=mnist.tr_d,
-        epochs=100,
-        mini_batch_size=20,
-        learning_rate=0.5,
-        test_data=mnist.te_d
+    
+    epochs = 100
+    batch_size = 20
+    learning_rate = 1
+    do_test = True
+    print(f"\nTRAINING\n"
+          f"  epochs    : {epochs}\n"
+          f"  batch sz  : {batch_size}\n"
+          f"  learn rate: {learning_rate}")
+    if profile:
+        torch_profile(
+            nn,
+            data_source=mnist,
+            batch_size=batch_size,
+            samples=1000
         )
 
+    nn.stoc_gradient_descent(
+        data_source=mnist,
+        epochs=epochs,
+        batch_sz=batch_size,
+        learning_rate=learning_rate,
+        test=do_test
+    )
+    
     if params_path:
         print("\nSAVE PARAMETERS")
         nn.save_params(params_path)
@@ -542,4 +674,4 @@ def main(data_path: str | None = "mnist.pkl.gz", params_path="mnist_params"):
     return
 
 if __name__ == "__main__":
-    main(params_path=None)
+    main(params_path=None, profile=False)
