@@ -73,13 +73,19 @@ $ python main.py
 
 
 ## Changelog Summary
-- Version 4.0.0:
+- Version 5.0.0:
+  - Replace manual tensor handling of model's layers with `torch.nn.ModuleList` and `nn.Linear`.
+  - Replace manual (and freely named) `NeuralNetwork._feedforward` method with specific `.forward()` method that integrates with torch system.
+  - Replace manual xavier and zero initializations with in-place `torch.init.xavier_` and `.zero_`, respectively.
+  - Replace manual stochastic gradient descent with `torch.optim.SGD`. As a consequence, updating the model's parameters simplifies to `sgd.step()`
+
+- [Version 4.0.0](../../tree/v4.0.0):
   - Replace manual backpropagation with Torch Autograd.
-  - Now training memory is managed by autograd.
+  - Now training memory is managed by Autograd.
 
 - [Version 3.0.0](../../tree/v3.0.0):
   - Parallel batched training. As a result, the model trains significantly faster than the previous version.
-  - Separates memory required for evaluation and training modes, introducing a `Workspace` that are allocated only during training.
+  - Separates memory required for evaluation and training modes, introducing a `Workspace` class that allocates training space only during training.
 
 - [Version 2.0.0](../../tree/v2.0.0):
   - Migrate tensors from NumPy to PyTorch.
