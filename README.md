@@ -16,11 +16,20 @@ A learning project that intends to evolve from a simple neural network built fro
 
 ### Test accuracy during training.
 ``` shell
-$ python main.py 
+$ python main.py
 PROBING SYSTEM
 XPU available?: True
 
 LOADING DATA
+Training:(X,Y):
+    X    torch.float32   [50000, 784]
+    Y      torch.int32   [50000, 1]
+Validation:(X,Y):
+    X    torch.float32   [10000, 784]
+    Y      torch.int32   [10000, 1]
+Test:(X,Y):
+    X    torch.float32   [10000, 784]
+    Y      torch.int32   [10000, 1]
 
 CREATING NETWORK
 in -> [784, 200, 200, 10] -> out
@@ -52,34 +61,6 @@ Epoch 100:  98.01%
 DONE!
 ```
 
-### About the speed...
-The [previous version](../../tree/v2.0.0) was making terrible use of the XPU because the operations sent to it (kernels) were too many and too small. The CPU would spend most of the time just adding the kernels to the queue (39.03%); and the time it would spend "preparing" the multiplications `aten::mm` and in-place additions `aten::add_` was about **86x longer than the operations themselves** in the XPU (1300ms on CPU vs 15ms in XPU).
-
-Profiling 1000 samples with batch size 20, on the XPU showed this:
-
-| Name                  | Self CPU% | Self CPU  | Self XPU | Self XPU% | # of Calls |
-|-----------------------|-----------|-----------|----------|-----------|------------|
-| urEnqueueKernelLaunch | 39.03%    | 1.563s    | 0.000us  | 0.00%     | 43600      |
-| aten::mm              | 22.52%    | 901.789ms | 5.928ms  | 17.93%    | 8000       |
-| aten::add_            | 9.94%     | 398.136ms | 9.120ms  | 27.59%    | 12300      |
-
-Now, with parallel batches, each batch sends one kernel rather than 20. The same profile shows:
-
-| Name                  | Self CPU% | Self CPU  | Self XPU  | Self XPU% | # of Calls |
-|-----------------------|-----------|-----------|-----------|-----------|------------|
-| aten::mm              | 31.74%    | 277.155ms | 666.400us | 15.61%    | 400        |
-| aten::sum             | 14.51%    | 126.687ms | 249.900us | 5.85%     | 150        |
-| urEnqueueKernelLaunch | 11.51%    | 100.477ms | 0.000us   | 0.00%     | 2563       |
-| aten::add_            | 11.10%    | 96.885ms  | 999.600us | 23.41%    | 600        |
-
-- Now the number of queued kernels got 17x smaller; that makes sense with batches of 20 elements, but adding some new kernels that handle operate on the batches.
-- Both tables show about 70% of the CPU time. In the first case that 70% takes 2863ms. In the batched implementation, 601ms. So the CPU is spending less time to accomplish the same work (training 1000 samples)!
-- Similarly, both tables show about 45% of the XPU time. In the first case it takes about 15ms while the batched version takes 2ms!
-
-All of this shows that batching does solve (to some degree) the bottleneck at the kernel dispatch overhead (40% -> 11%), making a more efficient use of the XPU. 
-
-However the time proportion of CPU/XPU (601ms/2ms) tells that the current configuration (remember that we are using batches of 20 MNIST images) is not even scratching the computation power of the XPU. It basically sits there waiting for the CPU to send some operation only to complete it in a blink.
-
 ## Running the code
 Place the `mnist.plk.gz` file at the root directory of this repo (you can get mnist [from here](https://github.com/mnielsen/neural-networks-and-deep-learning/raw/refs/heads/master/data/mnist.pkl.gz)), activate the conda environment (see [System Setup](#system-setup) section), and then run the main file.
 
@@ -92,7 +73,11 @@ $ python main.py
 
 
 ## Changelog Summary
-- Version 3.0.0:
+- Version 4.0.0:
+  - Replace manual backpropagation with Torch Autograd.
+  - Now training memory is managed by autograd.
+
+- [Version 3.0.0](../../tree/v3.0.0):
   - Parallel batched training. As a result, the model trains significantly faster than the previous version.
   - Separates memory required for evaluation and training modes, introducing a `Workspace` that are allocated only during training.
 
