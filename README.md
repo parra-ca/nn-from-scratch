@@ -12,11 +12,13 @@ A learning project that intends to evolve from a simple neural network built fro
 ## Results
 | Dataset  | Fully Connected |
 |----------|-----------------|
-| MNIST    | **98.12%**      |
+| MNIST    | **98.23%**      |
 
 ### Test accuracy during training.
 ``` shell
-$ python main.py
+$ python main.py                                                                                      (torch-xpu-0) 
+RUNNING: main.py
+
 PROBING SYSTEM
 XPU available?: True
 
@@ -35,29 +37,30 @@ CREATING NETWORK
 in -> [784, 200, 200, 10] -> out
 
 TRAINING
-  epochs    : 100
-  batch sz  : 20
-  learn rate: 1
-Epoch   1:  88.66%
-Epoch   2:  92.31%
-Epoch   3:  93.75%
-Epoch   4:  94.27%
-Epoch   5:  95.21%
-Epoch   6:  95.64%
-Epoch   7:  96.07%
-Epoch   8:  96.58%
+  epochs     : 100
+  batch sz   : 20
+  learn rate : 0.5
+Epoch   1:  93.30%
+Epoch   2:  95.70%
+Epoch   3:  96.57%
+Epoch   4:  96.86%
+Epoch   5:  97.21%
+Epoch   6:  97.18%
+Epoch   7:  97.14%
+Epoch   8:  97.47%
 ...
-Epoch  49:  98.12% <--- best
+Epoch  17:  98.23% <--- best
 ...
-Epoch  92:  98.03%
-Epoch  93:  98.04%
-Epoch  94:  98.05%
-Epoch  95:  98.02%
-Epoch  96:  98.01%
-Epoch  97:  98.01%
-Epoch  98:  98.04%
-Epoch  99:  98.02%
-Epoch 100:  98.01%
+Epoch  92:  98.13%
+Epoch  93:  98.10%
+Epoch  94:  98.10%
+Epoch  95:  98.13%
+Epoch  96:  98.14%
+Epoch  97:  98.12%
+Epoch  98:  98.09%
+Epoch  99:  98.09%
+Epoch 100:  98.13%
+SAVING W+B TO main_experiment.pth
 DONE!
 ```
 
@@ -71,9 +74,11 @@ $ conda activate torch-xpu
 $ python main.py
 ```
 
-
 ## Changelog Summary
-- Version 5.0.0:
+- Version 6.0.0:
+  - Replaces Mean Square Error with Cross Entropy, so model shows steeper gradients when "confidently wrong". This is evidenced by the model quickly learning at the beginning of the training, reaching its plateau at as early as epoch 17.
+
+- [Version 5.0.0](../../tree/v5.0.0):
   - Replace manual tensor handling of model's layers with `torch.nn.ModuleList` and `nn.Linear`.
   - Replace manual (and freely named) `NeuralNetwork._feedforward` method with specific `.forward()` method that integrates with torch system.
   - Replace manual xavier and zero initializations with in-place `torch.init.xavier_` and `.zero_`, respectively.

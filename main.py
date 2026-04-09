@@ -1,37 +1,20 @@
 from __future__ import annotations
-from collections.abc import Callable, Mapping
-from typing import Any, Protocol, cast
+from collections.abc import Callable
+from typing import cast
 
-import pickle
-import gzip
+import os, pickle, gzip
 _MINI_DATASET_SIZE = 100
 
-import math
 import torch
 import torch.nn as nn
 torch.set_printoptions(precision=3, sci_mode=False, linewidth=512)
 
-class FnActivation(Protocol):
-    def __call__(self, z: torch.Tensor) -> torch.Tensor: ...
-class FnLoss(Protocol):
-    def __call__(self, y_hat: torch.Tensor, y: torch.Tensor) -> torch.Tensor: ...
-class FnDecision(Protocol):
-    def __call__(self, a: torch.Tensor) -> torch.Tensor: ...
-class FnDecisionInv(Protocol):
-    def __call__(self, y: torch.Tensor, out_layer: torch.Tensor) -> torch.Tensor: ...
 # Activation functions
 def sigmoid(z: torch.Tensor) -> torch.Tensor:
     return 1.0 / (1.0 + torch.exp(-z))
-# Cost and cost derivative functions
-def mse(y_hat: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    diff = y_hat - y
-    return 0.5 * torch.sum(diff * diff)
 # Decision functions
 def argmax(a: torch.Tensor) -> torch.Tensor: 
     return torch.argmax(a, dim=1, keepdim=True)
-def argmax_inv(y: torch.Tensor, out_layer: torch.Tensor):
-    out = torch.zeros_like(out_layer)
-    return torch.scatter(out, dim=1, index=y.long(), value=1.0)
 
 
 class MnistLoader(object):
@@ -73,16 +56,18 @@ class MnistLoader(object):
         self.tr_d_alt_Y = tmp_tr[1]
         return
 
-    def mini_sample(self):
-        in_base = 0
-        in_size = 784
-        ds_size = _MINI_DATASET_SIZE
-        self.tr_d = (self.tr_d[0][:ds_size,in_base:in_base+in_size],
-                     self.tr_d[1][:ds_size])
-        self.te_d = (self.te_d[0][:ds_size,in_base:in_base+in_size],
-                     self.te_d[1][:ds_size])
-        self.va_d = (self.va_d[0][:ds_size,in_base:in_base+in_size],
-                     self.va_d[1][:ds_size])
+    def mini_sample(self, in_base=0, in_sz=784, train_sz=None, val_sz=None,
+                    test_sz=None):
+        train_sz = train_sz if train_sz is not None else _MINI_DATASET_SIZE
+        val_sz = val_sz if val_sz is not None else _MINI_DATASET_SIZE
+        test_sz = test_sz if test_sz is not None else _MINI_DATASET_SIZE
+
+        self.tr_d = (self.tr_d[0][:train_sz,in_base:in_base+in_sz],
+                     self.tr_d[1][:train_sz])
+        self.va_d = (self.va_d[0][:val_sz,in_base:in_base+in_sz],
+                     self.va_d[1][:val_sz])
+        self.te_d = (self.te_d[0][:test_sz,in_base:in_base+in_sz],
+                     self.te_d[1][:test_sz])
         self.tr_d_alt_X = torch.empty_like(self.tr_d[0])
         self.tr_d_alt_Y = torch.empty_like(self.tr_d[1])
         return
@@ -102,11 +87,9 @@ class NeuralNetwork(nn.Module):
     def __init__(
             self,
             layer_sizes: list[int],
-            activ_hl: FnActivation,
-            activ_ol: FnActivation,
-            loss: FnLoss,
-            decision: FnDecision,
-            decision_inv: FnDecisionInv,
+            activ_hl: Callable[[torch.Tensor], torch.Tensor],
+            loss: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+            decision: Callable[[torch.Tensor], torch.Tensor],
             seed=42
     ) -> None:
         super().__init__()
@@ -126,10 +109,8 @@ class NeuralNetwork(nn.Module):
             
         # hidden and output activation functions
         self.fn_activ_hl = activ_hl
-        self.fn_activ_ol = activ_ol
         self.fn_loss = loss
         self.fn_decision = decision
-        self.fn_decision_inv = decision_inv
         return
     
     @staticmethod
@@ -154,7 +135,7 @@ class NeuralNetwork(nn.Module):
             a = self.fn_activ_hl(layer(a))
 
         # OUTPUT LAYER
-        return self.fn_activ_ol(self.layers[-1](a))
+        return self.layers[-1](a)
 
     def stoc_grad_descent(
             self,
@@ -167,11 +148,10 @@ class NeuralNetwork(nn.Module):
         # trim train data to fit an exact number of batches
         train_full_sz = data_source.tr_d[0].shape[0]  
         train_sz = train_full_sz - (train_full_sz % batch_sz)
-        alpha = learning_rate / batch_sz
 
         # train a number of epochs
         self.train()
-        sgd = torch.optim.SGD(params=self.parameters(), lr=alpha)
+        sgd = torch.optim.SGD(params=self.parameters(), lr=learning_rate)
         for epoch in range(epochs):
             print(f"Epoch {(epoch+1):3}: ", end="", flush=True)
 
@@ -190,10 +170,10 @@ class NeuralNetwork(nn.Module):
 
                 # forward and backward pass
                 out_ly_batch = self(X_batch)
-                y_as_ly_batch = self.fn_decision_inv(Y_batch, out_ly_batch)
-                loss = self.fn_loss(out_ly_batch, y_as_ly_batch)
+                loss = self.fn_loss(out_ly_batch, Y_batch.squeeze().long())
                 loss.backward()
 
+                # update parameters
                 sgd.step()
 
             
@@ -242,9 +222,9 @@ def run_sample(model: NeuralNetwork, train_data, sgd: torch.optim.SGD,
     for start_idx in range(0, samples, batch_sz):
         end_idx = min(samples, start_idx+batch_sz)
         X_batch,Y_batch = X[start_idx:end_idx], Y[start_idx:end_idx]
+        sgd.zero_grad()
         out_layer_batch = model(X_batch)
-        y_as_layer_batch = model.fn_decision_inv(Y_batch, out_layer_batch)
-        loss = model.fn_loss(out_layer_batch, y_as_layer_batch)
+        loss = model.fn_loss(out_layer_batch, Y_batch.squeeze().long())
         loss.backward()
         sgd.step()
     return
@@ -280,49 +260,78 @@ def torch_profile(model: NeuralNetwork,
     print(prof.key_averages().table(sort_by="self_cpu_time_total", row_limit=20))
     exit(0)
 
-def main(data_path: str = "mnist.pkl.gz"):
-    print("PROBING SYSTEM")
+def main(
+        data_path: str = "mnist.pkl.gz",
+        epochs = 100,
+        hidden_lys = [200, 200],
+        batch_sz = 2000,
+        lr = 0.5,
+        do_test = True,
+        load_path: str | None = None,
+        save_path: str | None = None
+): 
+    print("\nPROBING SYSTEM")
     print("XPU available?:", torch.xpu.is_available())
 
     
     print("\nLOADING DATA")
-    mnist = MnistLoader(data_path)
+    mnist = MnistLoader(data_path, device="cpu")
+    #mnist.mini_sample(train_sz=1000, val_sz=1000, test_sz=1000)
     mnist.describe()
 
     
     print("\nCREATING NETWORK")
     in_ly_sz = [mnist.tr_d[0].shape[1]]
-    hidden_lys = [200, 200]
     out_ly_sz = [10]
     all_layers = in_ly_sz + hidden_lys + out_ly_sz
     print("in ->", all_layers, "-> out")
     my_net = NeuralNetwork(
-        all_layers,
-        sigmoid, sigmoid, mse, argmax, argmax_inv,
-        42
+        layer_sizes=all_layers,
+        activ_hl=sigmoid,
+        loss=nn.functional.cross_entropy,
+        decision=argmax,
+        seed=42
     )
-    my_net.to("xpu")
+    if load_path is not None:
+        print(f"LOADING W+B FROM {load_path}")
+        my_net.load_state_dict(torch.load(load_path, weights_only=True))
+    #my_net.to("xpu")
 
-
-    epochs = 100
-    batch_size = 20
-    learning_rate = 0.5
-    do_test = True
-    # torch_profile(my_net, mnist, batch_size, 1000)
+    #torch_profile(my_net, mnist, batch_sz, 1000)
     print(f"\nTRAINING\n"
-          f"  epochs    : {epochs}\n"
-          f"  batch sz  : {batch_size}\n"
-          f"  learn rate: {learning_rate}")
+          f"  epochs     : {epochs}\n"
+          f"  batch sz   : {batch_sz}\n"
+          f"  learn rate : {lr}")
     my_net.stoc_grad_descent(
         data_source=mnist,
         epochs=epochs,
-        batch_sz=batch_size,
-        learning_rate=learning_rate,
+        batch_sz=batch_sz,
+        learning_rate=lr,
         test=do_test
     )
 
+    if save_path is not None:
+        print(f"SAVING W+B TO {save_path}")
+        torch.save(my_net.state_dict(), save_path)
     print("DONE!")
     return
 
 if __name__ == "__main__":
-    main()
+    try:
+        script_name = os.path.basename(__file__)
+        load_name = os.path.splitext(script_name)[0]+".pth"
+        save_name = os.path.splitext(script_name)[0]+"_experiment.pth" 
+        print(f"RUNNING: {script_name}")
+        main(
+            epochs=100,
+            batch_sz=20,
+            lr=0.5,
+            hidden_lys=[200, 200],
+            do_test=True,
+            #load_path=load_name,
+            save_path=save_name
+        )
+    except KeyboardInterrupt:
+        print("\n\n---- interrupted! ----\n")
+        exit(0)
+
