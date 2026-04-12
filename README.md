@@ -12,57 +12,31 @@ A learning project that intends to evolve from a simple neural network built fro
 ## Results
 | Dataset  | Fully Connected |
 |----------|-----------------|
-| MNIST    | **98.23%**      |
+| MNIST    | **99.25%**      |
+| CIFAR-10 | **56.31%**      |
 
-### Test accuracy during training.
-``` shell
-$ python main.py                                                                                      (torch-xpu-0) 
-RUNNING: main.py
+### Weight decay and Dropout
+Regularization techniques, in general, disencourage complex models that rely on specific features, activations, or weights; in an attempt to avoid memorizing the training data (overfitting) and actually produce a model that is more general.
 
-PROBING SYSTEM
-XPU available?: True
+In order to overfit the training data and see the effects of regularization, let's trim it to 5000 samples. With no weight decay or dropout (blue), training accuracy quickly  reaches 100% (thin line), but validation accuracy (thicker line) peak at 94.67% (star marker); resulting in the final test accuracy of 94.13% (triangle marker).
 
-LOADING DATA
-Training:(X,Y):
-    X    torch.float32   [50000, 784]
-    Y      torch.int32   [50000, 1]
-Validation:(X,Y):
-    X    torch.float32   [10000, 784]
-    Y      torch.int32   [10000, 1]
-Test:(X,Y):
-    X    torch.float32   [10000, 784]
-    Y      torch.int32   [10000, 1]
+Each, weight decay and dropout help to reduce the gap between train and validation accuracy. But combined, they make the model generalize even better.
 
-CREATING NETWORK
-in -> [784, 200, 200, 10] -> out
+![Weight Decay](img/701_SGD_weight-decay_plot.png)
+![Dropout](img/702_SGD_dropout_plot.png)
+![Weight Decay + Dropout](img/703_SGD_weight-decay-and-dropout_plot.png)
 
-TRAINING
-  epochs     : 100
-  batch sz   : 20
-  learn rate : 0.5
-Epoch   1:  93.30%
-Epoch   2:  95.70%
-Epoch   3:  96.57%
-Epoch   4:  96.86%
-Epoch   5:  97.21%
-Epoch   6:  97.18%
-Epoch   7:  97.14%
-Epoch   8:  97.47%
-...
-Epoch  17:  98.23% <--- best
-...
-Epoch  92:  98.13%
-Epoch  93:  98.10%
-Epoch  94:  98.10%
-Epoch  95:  98.13%
-Epoch  96:  98.14%
-Epoch  97:  98.12%
-Epoch  98:  98.09%
-Epoch  99:  98.09%
-Epoch 100:  98.13%
-SAVING W+B TO main_experiment.pth
-DONE!
-```
+### Data augmentation
+Train data can be augmented by introducing small alterations to the original train dataset. Below, 9 input samples of MNIST and CIFAR-10 with some random alterations at their right. Made with the `kornia` python module.
+Different augmentations make sense for different scenarios: in gray-scale character recognition you don't want to flip the image or alter the colors, but in photos, that is a reasonable augmentation.
+![Augmented MNIST Data](img/mnist_augmented.png)
+![Augmented CIFAR-10 Data](img/cifar_augmented.png)
+
+The following plot shows the training of a fully connected network on MNIST, using AdamW with Cosine Annealing LR scheduling. Using only the original dataset of 50K samples yields a 98.66% accuracy (blue line). Augmenting the data improves accuracy; particularly, when augmented 16x, a 99.25% accuracy is obtained.
+![Augmented Training on MNIST](img/711_mnist_augmentation_plot.png)
+
+Here is the same fully connected architecture training on CIFAR-10. The original dataset (50K - 5K validation samples) shows 48.98% test accuracy. A 16x data augmentation improves it to 56.31%. Although a convolutional model is a much better architecture for image classification, artificially augmenting the training data is a powerful tool.
+![Augmented Training on CIFAR-10](img/721_cifar10_augmentation_plot.png)
 
 ## Running the code
 Place the `mnist.plk.gz` file at the root directory of this repo (you can get mnist [from here](https://github.com/mnielsen/neural-networks-and-deep-learning/raw/refs/heads/master/data/mnist.pkl.gz)), activate the conda environment (see [System Setup](#system-setup) section), and then run the main file.
@@ -71,11 +45,88 @@ Place the `mnist.plk.gz` file at the root directory of this repo (you can get mn
 $ ls mnist.pkl.gz
 mnist.pkl.gz
 $ conda activate torch-xpu
-$ python main.py
+$ python main.py 
+
+XPU AVAILABLE: True
+
+LOADING DATA: cifar-10
+Augmenting Dataset: 16.0x...............
+Training:(X,Y):
+    X    torch.float32   [720000, 3, 32, 32]
+    Y      torch.int32   [720000, 1]
+Validation:(X,Y):
+    X    torch.float32   [5000, 3, 32, 32]
+    Y      torch.int32   [5000, 1]
+Test:(X,Y):
+    X    torch.float32   [10000, 3, 32, 32]
+    Y      torch.int32   [10000, 1]
+
+CREATING MODEL
+
+TRAINING
+  epochs     : 200
+  batch_sz   : 80
+  hid_layers : [3000, 1000]
+  lrn_rate   : 0.0005
+  w_decay    : 0.0016
+  betas      : (0.9, 0.999)
+  dropout    : 0.5
+Epoch   1: tra: 41.77%   val: 41.25% <-- new best!
+Epoch   2: tra: 43.23%   val: 43.45% <-- new best!
+Epoch   3: tra: 43.43%   val: 45.08% <-- new best!
+Epoch   4: tra: 45.89%   val: 46.65% <-- new best!
+Epoch   5: tra: 44.98%   val: 45.48%
+Epoch   6: tra: 45.89%   val: 46.47%
+Epoch   7: tra: 46.09%   val: 47.44% <-- new best!
+Epoch   8: tra: 47.06%   val: 47.56% <-- new best!
+...
+Epoch 170: tra: 59.46%   val: 57.74% <-- new best!
+...
+Epoch 192: tra: 59.58%   val: 57.46%
+Epoch 193: tra: 59.80%   val: 57.50%
+Epoch 194: tra: 59.74%   val: 57.34%
+Epoch 195: tra: 59.48%   val: 57.30%
+Epoch 196: tra: 59.74%   val: 57.32%
+Epoch 197: tra: 59.42%   val: 57.36%
+Epoch 198: tra: 59.54%   val: 57.42%
+Epoch 199: tra: 59.52%   val: 57.54%
+Epoch 200: tra: 59.44%   val: 57.36%
+
+SAVING PLOT DATA: plots/12_cifar10_augmentation_056.31__0411-142449.json
+
+PLOTTING ALL 'plots/12_cifar10_augmentation_*.json' FILES.
 ```
 
 ## Changelog Summary
-- Version 6.0.0:
+- Version 7.0.0:
+  - Split code into `main.py` and `nnfw.py` (Neural Network framework)
+  
+  - **Activation function, regularization, and optimization loop**:
+    - Replaced sigmoid activation for ReLU (faster math, and does not saturate, while still introducing non-linearity)
+    - Add Weight decay only for weights (not for biases), and Dorpout.
+    - Learning Rate Scheduling (Cosine Annealing).
+    - Replace stochastic gradient descent with AdamW.
+
+  - **Data augmentation and sample exporting**:
+    - Add manual data augmentation though Kornia library. Including randomized: elastic deformations, corp, horizontal flip, affine transformation, and color variations.
+    - Specify a multiplier factor to augment (or trim) the original training data, which is shuffled and kept as the training dataset. (Validation and test data never augmented or shuffled.) This makes each augmentation be visited once per epoch.
+    - Augmentation is performed once, and results are kept in-memory, avoiding online computation at the expense of memory.
+    - `Loader._export_img()`: Original and Augmented images are exported and drawn side by side.
+    
+  - **Generalization of Data Loader and Model**:
+    - Generalize `Loader` class for common Loader interface and add `MnistLoader` and `CifarLoader` ([CIFAR-10](https://www.cs.toronto.edu/~kriz/cifar-10-python.tar.gz)) subclasses.
+    - Generalize neural network model class `Module(nn.Module)` so subclasses only need to implement an updated `__init__()`, `forward()` and `fit()`.
+
+  - **Training monitoring and checkpoint**:
+    - Monitor validation accuracy, tracking best performing set of parameters (checkpoint); and applying final parameters restoration.
+    - Add network collapse detection.
+
+  - **Training plots**:
+    - Add training, validation, and testing plot production.
+    - Save training log data (metadata and train/validation/test accuracy values) for multi-training comparative training (in JSON format)
+    - Multi-train plots group common hyperparameters into the plot's title and add only contrasting values to legend.
+
+- [Version 6.0.0](../../tree/v6.0.0):
   - Replaces Mean Square Error with Cross Entropy, so model shows steeper gradients when "confidently wrong". This is evidenced by the model quickly learning at the beginning of the training, reaching its plateau at as early as epoch 17.
 
 - [Version 5.0.0](../../tree/v5.0.0):

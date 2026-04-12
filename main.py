@@ -1,337 +1,306 @@
 from __future__ import annotations
-from collections.abc import Callable
-from typing import cast
-
-import os, pickle, gzip
-_MINI_DATASET_SIZE = 100
-
+from typing import Mapping, Any, cast, override
 import torch
-import torch.nn as nn
-torch.set_printoptions(precision=3, sci_mode=False, linewidth=512)
+from torch import Tensor, nn
+import nnfw
 
-# Activation functions
-def sigmoid(z: torch.Tensor) -> torch.Tensor:
-    return 1.0 / (1.0 + torch.exp(-z))
-# Decision functions
-def argmax(a: torch.Tensor) -> torch.Tensor: 
-    return torch.argmax(a, dim=1, keepdim=True)
-
-
-class MnistLoader(object):
-    def __init__(self, path, device="xpu"):
-        try:
-            f = gzip.open(path, 'rb')
-        except FileNotFoundError as e:
-            print(f"Could not find '{path}'.")
-            exit(1)
-        u = pickle._Unpickler(f)
-        u.encoding = 'latin1'
-        self.tr_d, self.va_d, self.te_d = u.load()
-        f.close()
-        self.flatten_data(torch.device(device))
-
-    def flatten_data(self, device):
-        for dname in ("tr_d", "va_d", "te_d"):
-            X,Y = getattr(self, dname)
-            X_tensor = torch.tensor(X, dtype=torch.float32, device=device)
-            Y_tensor = torch.tensor(Y, dtype=torch.int32, device=device).reshape(-1,1)
-            setattr(self, dname, (X_tensor, Y_tensor))
-
-        # alternative memory blocks for data shuffling
-        self.tr_d_alt_X = torch.empty_like(self.tr_d[0])
-        self.tr_d_alt_Y = torch.empty_like(self.tr_d[1])
-        return
-
-    def shuffle_training_data(self):
-        # tr_d --> shuffle --> tr_d_alt
-        X, Y = self.tr_d
-        rand_indices = torch.randperm(X.shape[0], device=X.device)
-        torch.index_select(X, dim=0, index=rand_indices, out=self.tr_d_alt_X)
-        torch.index_select(Y, dim=0, index=rand_indices, out=self.tr_d_alt_Y)
-
-        # flip pointers so that tr_d has the shuffled data
-        tmp_tr = self.tr_d
-        self.tr_d = (self.tr_d_alt_X, self.tr_d_alt_Y)
-        self.tr_d_alt_X = tmp_tr[0]
-        self.tr_d_alt_Y = tmp_tr[1]
-        return
-
-    def mini_sample(self, in_base=0, in_sz=784, train_sz=None, val_sz=None,
-                    test_sz=None):
-        train_sz = train_sz if train_sz is not None else _MINI_DATASET_SIZE
-        val_sz = val_sz if val_sz is not None else _MINI_DATASET_SIZE
-        test_sz = test_sz if test_sz is not None else _MINI_DATASET_SIZE
-
-        self.tr_d = (self.tr_d[0][:train_sz,in_base:in_base+in_sz],
-                     self.tr_d[1][:train_sz])
-        self.va_d = (self.va_d[0][:val_sz,in_base:in_base+in_sz],
-                     self.va_d[1][:val_sz])
-        self.te_d = (self.te_d[0][:test_sz,in_base:in_base+in_sz],
-                     self.te_d[1][:test_sz])
-        self.tr_d_alt_X = torch.empty_like(self.tr_d[0])
-        self.tr_d_alt_Y = torch.empty_like(self.tr_d[1])
-        return
+def argmax(a_batch: Tensor) -> Tensor:
+    """Returns index of the highest logit in each sample of the received batch"""
+    return torch.argmax(a_batch, dim=1, keepdim=True)
     
-    def describe(self):
-        names = ("Training", "Validation", "Test")
-        parts = (self.tr_d, self.va_d, self.te_d)
-        for name, data_set in zip(names, parts):
-            x,y = data_set
-            xdt, ydt = str(x.dtype), str(y.dtype)
-            print(f"{name}:(X,Y):\n"
-                  f"    X   {xdt:>14}   {list(x.shape)}\n"
-                  f"    Y   {ydt:>14}   {list(y.shape)}")
-        return
-    
-class NeuralNetwork(nn.Module):
+class NeuralNetwork(nnfw.Module):
+    """Feedforward netwrk with optional dropout, trained with AdamW
+    and cosine annealing learning rate schedule."""
+    @override
     def __init__(
             self,
-            layer_sizes: list[int],
-            activ_hl: Callable[[torch.Tensor], torch.Tensor],
-            loss: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
-            decision: Callable[[torch.Tensor], torch.Tensor],
-            seed=42
-    ) -> None:
-        super().__init__()
-        self.__random_seed(seed)
+            hyp_params: Mapping[str, Any],
+            model_fns: Mapping[str, Any],
+            data_source: nnfw.Loader,
+    ):
+        super().__init__(hyp_params, model_fns, data_source)
 
         # list of layers
+        hid_layers = hyp_params["hid_layers"]
+        layer_sizes = [data_source.in_ly_sz] + hid_layers + \
+            [data_source.out_ly_sz]
         self.layers = nn.ModuleList(
-            [nn.Linear(fan_in, fan_out, bias=True)
+            [nn.Linear(fan_in, fan_out, bias=True, dtype=nnfw.FLOAT_DTYPE,
+                       device=self.device)
              for fan_in,fan_out in zip(layer_sizes[:-1],layer_sizes[1:])]
         )
+
+        if "dropout" in hyp_params:
+            self.dropout = nn.Dropout(p=hyp_params["dropout"])
 
         # initial parameters with Xavier (and zero for biases)
         for l in self.layers:
             l = cast(nn.Linear, l)
             nn.init.xavier_uniform_(l.weight)
             nn.init.zeros_(l.bias)
-            
-        # hidden and output activation functions
-        self.fn_activ_hl = activ_hl
-        self.fn_loss = loss
-        self.fn_decision = decision
         return
     
-    @staticmethod
-    def __random_seed(
-            seed: int = 42) -> None:
-        torch.manual_seed(seed);        
-        if torch.xpu.is_available():
-            torch.xpu.manual_seed_all(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
-        return
-    
+    @override
     def forward(
             self,
-            input_batch: torch.Tensor
-    ) -> torch.Tensor:
+            input_batch: Tensor,
+    ) -> Tensor:
         # INPUT LAYER
-        a = input_batch
+        a = input_batch.flatten(start_dim=1)
 
         # HIDDEN LAYERS
         for layer in self.layers[:-1]:
             a = self.fn_activ_hl(layer(a))
 
+            # apply dropout if it was part of the net construction.
+            if hasattr(self, "dropout"):
+                a = self.dropout(a)
+            
         # OUTPUT LAYER
         return self.layers[-1](a)
 
-    def stoc_grad_descent(
+    @override
+    def fit(
             self,
-            data_source: MnistLoader,
-            epochs: int,
-            batch_sz: int,
-            learning_rate: float,
-            test: bool = False
-    ):
+            data_source: nnfw.Loader,
+    ) -> None:
+        epochs = self.hyp_params["epochs"]
+        batch_sz = self.hyp_params["batch_sz"]
+        learning_rate = self.hyp_params["lrn_rate"]
+        weight_decay = self.hyp_params["w_decay"]
+        betas = self.hyp_params["betas"]
+
         # trim train data to fit an exact number of batches
-        train_full_sz = data_source.tr_d[0].shape[0]  
+        train_full_sz = data_source.data_train[0].shape[0]  
         train_sz = train_full_sz - (train_full_sz % batch_sz)
 
-        # train a number of epochs
+        # extract unshuffled subset of training set to monitor accuracy
+        data_sz = data_source.data_valid[0].shape[0]
+        train_sample = (data_source.data_train[0][:data_sz].clone(),
+                        data_source.data_train[1][:data_sz].clone())
+
+        # create optimizer
         self.train()
-        sgd = torch.optim.SGD(params=self.parameters(), lr=learning_rate)
+        optimizer = torch.optim.AdamW(
+            params=[
+                {"params":[p for n,p in self.named_parameters() if 'weight' in n],
+                 "weight_decay": weight_decay},
+                {"params":[p for n,p in self.named_parameters() if 'bias' in n],
+                 "weight_decay": 0.0}
+            ],
+            lr=learning_rate,
+            betas=betas,
+        )
+
+        # create scheduled learn rate
+        sched_lr = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=epochs, eta_min=1e-6)
+        
+        # train a number of epochs
         for epoch in range(epochs):
             print(f"Epoch {(epoch+1):3}: ", end="", flush=True)
-
             # shuffle data before creating the mini-batches
             if epoch != 0:
                 data_source.shuffle_training_data()
 
             # do one gradient step per mini_batch
-            X,Y = data_source.tr_d
+            X,Y = data_source.data_train
             for start_idx in range(0, train_sz, batch_sz):
                 end_idx = start_idx+batch_sz
-                X_batch,Y_batch = X[start_idx:end_idx], Y[start_idx:end_idx]
-
-                # clear gradients
-                sgd.zero_grad()
-
-                # forward and backward pass
+                X_batch = X[start_idx:end_idx].to(self.device)
+                Y_batch = Y[start_idx:end_idx].to(self.device)
+                optimizer.zero_grad()
                 out_ly_batch = self(X_batch)
                 loss = self.fn_loss(out_ly_batch, Y_batch.squeeze().long())
                 loss.backward()
+                optimizer.step()
 
-                # update parameters
-                sgd.step()
-
+            # update learning rate
+            sched_lr.step()
             
-            # test how good the network is doing
-            if (test or epoch+1 == epochs) and data_source.te_d is not None:
-                test_data = data_source.te_d
-                correct, total = self._evaluate(test_data, batch_sz) 
-                perc = 100 * correct / total
-                print(f"{perc:6.2f}%")
-                if abs(perc - 100) < 0.0000001:
-                    print("Good enough! Early exit.")
-                    break
-                self.train()
-            else:
-                print(f"complete.")
+            # monitor network accuracy
+            accu_msg, do_break = self.monitor_accuracy(
+                train_sample, data_source.data_valid, batch_sz, save_best=True)
+            print(accu_msg)
+            if do_break:
+                break
 
-    def _evaluate(
-            self,
-            test_data: tuple[torch.Tensor, torch.Tensor],
-            batch_sz: int
-    ) -> tuple[int, int]:
-
-        # trim train data to fit an exact number of batches
-        test_full_sz = test_data[0].shape[0]
-        test_sz = test_full_sz - (test_full_sz % batch_sz)
-
-        # evaluate in batches
+        # restore parameters of the best performing net
         self.eval()
-        with torch.no_grad():
-            X,Y = test_data
-            correct_count = torch.zeros((1,), dtype=torch.int64, device=Y.device)
-            for start_idx in range(0, test_sz, batch_sz):
-                end_idx = start_idx+batch_sz
-                X_batch,Y_batch = X[start_idx:end_idx], Y[start_idx:end_idx]
-                
-                out_layer = self(X_batch)
-                y_hat_batch = self.fn_decision(out_layer)
-                correct_count += torch.sum(y_hat_batch == Y_batch)
-            # return the total correct predictions and the total samples
-            corr_count_int = int(correct_count.item())
-        return (corr_count_int, test_sz)
+        if self.best_state_dict is not None:
+            self.load_state_dict(self.best_state_dict)
+        else:
+            raise RuntimeError("No best state to restore")
+        return
 
-def run_sample(model: NeuralNetwork, train_data, sgd: torch.optim.SGD,
-               batch_sz: int, samples: int = 100):
-    X, Y = train_data
-    for start_idx in range(0, samples, batch_sz):
-        end_idx = min(samples, start_idx+batch_sz)
-        X_batch,Y_batch = X[start_idx:end_idx], Y[start_idx:end_idx]
-        sgd.zero_grad()
-        out_layer_batch = model(X_batch)
-        loss = model.fn_loss(out_layer_batch, Y_batch.squeeze().long())
-        loss.backward()
-        sgd.step()
+def exp__weight_decay_dropout(general, data_params, hyp_params, plot_params,
+                              just_plot=False):
+    general = dict(**general)
+    data_params = dict(**data_params)
+    hyp_params = dict(**hyp_params)
+    plot_params = dict(**plot_params)
+    general["about"] = "SGD. ReLU. Cosine Annealing LR sched."
+    pars = [
+        (
+            "Regularization on small dataset: Weight Decay",
+            "plots/701_SGD_weight-decay_",
+            [100, 100],
+            100,
+            [(0.0000, 0.00), (0.0005, 0.00), (0.0010, 0.00)]
+         ),(
+            "Regularization on small dataset: Dropout",
+            "plots/702_SGD_dropout_",
+            [100, 100],
+            100,
+            [(0.0000, 0.00), (0.0000, 0.25), (0.0000, 0.50)],
+        ),(
+            "Regularization on small dataset: Weight Decay + Dropout",
+            "plots/703_SGD_weight-decay-and-dropout_",
+            [100, 100],
+            100,
+            [(0.0000, 0.00), (0.0005, 0.20)]
+        ),
+    ]
+    plot_params["y_range"] = (93, 100)
+
+    for ti,pf,ly,bs,wd_dr in pars:
+        general["title"] = ti
+        general["prefix"] = pf
+        hyp_params["hid_layers"] = ly
+        hyp_params["batch_sz"] = bs
+        for wd,dr in wd_dr:
+            nnfw.random_seed(10)
+            hyp_params["w_decay"] = wd
+            hyp_params["dropout"] = dr
+            if just_plot:
+                nnfw.plot_all(plot_params, general["prefix"])
+                break
+            nnfw.model_train_eval(general, data_params, hyp_params, plot_params)
+            nnfw.plot_all(plot_params, general["prefix"])
     return
 
-def profile(model: NeuralNetwork,
-            data_source: MnistLoader,
-            batch_size: int,
-            samples: int):
-    print("PROFILING")
-    import cProfile
-    profiler = cProfile.Profile()
-    sgd =  torch.optim.SGD(params=model.parameters(), lr=0.5)
-    profiler.enable()
-    run_sample(model, data_source.tr_d, sgd, batch_size, samples)
-    profiler.disable()
-    profiler.print_stats(sort="tottime")
-    exit(0)
+def exp__augment_mnist(general, data_params, hyp_params, plot_params,
+                       just_plot=False):
+    general = dict(**general)
+    data_params = dict(**data_params)
+    hyp_params = dict(**hyp_params)
+    plot_params = dict(**plot_params)
+    general["title"] = "MNIST Data Augmentation"
+    general["about"] = "AdamW. ReLU. Cosine Annealing LR sched."
+    general["prefix"] = "plots/711_mnist_augmentation_"
+    hyp_params["hid_layers"] = [784, 500, 100]
+    data_params["augm_params"] = {
+        "elastic": {"kernel_size": (57, 57),
+                    "sigma"      : (9.0, 9.0),
+                    "alpha"      : (15, 15),},
+        #"hflip"  : {},
+        "affine" : {"degrees"    : (-10, 10),
+                    "shear"      : (-5, 5),
+                    "scale"      : (0.9, 1.1)},
+        "crop"   : {"size"       : (28, 28),
+                    "padding"    : 2},
+        # "color"  : {"brightness" : 0.2,
+        #             "contrast"   : 0.2,
+        #             "saturation" : 0.2,
+        #             "hue"        : 0.05,},
+    }
+    plot_params["y_range"] = (96, 100)
+    factors = [1.0, 1.5, 2.0, 4.0, 8.0, 16.0]
+    for f in factors:
+        nnfw.random_seed(10)
+        data_params["factor"] = f
+        if just_plot:
+            nnfw.plot_all(plot_params, general["prefix"])
+            break
+        nnfw.model_train_eval(general, data_params, hyp_params, plot_params)
+        nnfw.plot_all(plot_params, general["prefix"])
+    return
 
-def torch_profile(model: NeuralNetwork,
-                  data_source: MnistLoader,
-                  batch_size: int,
-                  samples: int = 100):
-    print("PROFILING")
-    sgd =  torch.optim.SGD(params=model.parameters(), lr=0.5)
-    with torch.profiler.profile(
-        activities=[
-            torch.profiler.ProfilerActivity.CPU,
-            torch.profiler.ProfilerActivity.XPU,
-        ],
-        acc_events=True
-    ) as prof:
-        run_sample(model, data_source.tr_d, sgd, batch_size, samples)
-    print(prof.key_averages().table(sort_by="self_cpu_time_total", row_limit=20))
-    exit(0)
+def exp__augment_cifar(general, data_params, hyp_params, plot_params,
+                       just_plot=False):
+    general = dict(**general)
+    data_params = dict(**data_params)
+    hyp_params = dict(**hyp_params)
+    plot_params = dict(**plot_params)
+    general["title"] = "CIFAR-10 Data Augmentation"
+    general["about"] = "AdamW. ReLU. Cosine Annealing LR sched."
+    general["prefix"] = "plots/721_cifar10_augmentation_"
+    hyp_params["hid_layers"] = [3000, 1000]
+    data_params["dataset"] = "cifar-10"
+    plot_params["y_range"] = (40, 65)
+    data_params["augm_params"] = {
+        # "elastic": {"kernel_size": (57, 57),
+        #             "sigma"      : (9.0, 9.0),
+        #             "alpha"      : (15, 15),},
+        "hflip"  : {},
+        # "affine" : {"degrees"    : (-10, 10),
+        #             "shear"      : (-5, 5),
+        #             "scale"      : (0.9, 1.1)},
+        "crop"   : {"size"       : (32, 32),
+                    "padding"    : 2},
+        "color"  : {"brightness" : 0.2,
+                    "contrast"   : 0.2,
+                    "saturation" : 0.2,
+                    "hue"        : 0.05,},
+    }
 
-def main(
-        data_path: str = "mnist.pkl.gz",
-        epochs = 100,
-        hidden_lys = [200, 200],
-        batch_sz = 2000,
-        lr = 0.5,
-        do_test = True,
-        load_path: str | None = None,
-        save_path: str | None = None
-): 
-    print("\nPROBING SYSTEM")
-    print("XPU available?:", torch.xpu.is_available())
-
-    
-    print("\nLOADING DATA")
-    mnist = MnistLoader(data_path, device="cpu")
-    #mnist.mini_sample(train_sz=1000, val_sz=1000, test_sz=1000)
-    mnist.describe()
-
-    
-    print("\nCREATING NETWORK")
-    in_ly_sz = [mnist.tr_d[0].shape[1]]
-    out_ly_sz = [10]
-    all_layers = in_ly_sz + hidden_lys + out_ly_sz
-    print("in ->", all_layers, "-> out")
-    my_net = NeuralNetwork(
-        layer_sizes=all_layers,
-        activ_hl=sigmoid,
-        loss=nn.functional.cross_entropy,
-        decision=argmax,
-        seed=42
-    )
-    if load_path is not None:
-        print(f"LOADING W+B FROM {load_path}")
-        my_net.load_state_dict(torch.load(load_path, weights_only=True))
-    #my_net.to("xpu")
-
-    #torch_profile(my_net, mnist, batch_sz, 1000)
-    print(f"\nTRAINING\n"
-          f"  epochs     : {epochs}\n"
-          f"  batch sz   : {batch_sz}\n"
-          f"  learn rate : {lr}")
-    my_net.stoc_grad_descent(
-        data_source=mnist,
-        epochs=epochs,
-        batch_sz=batch_sz,
-        learning_rate=lr,
-        test=do_test
-    )
-
-    if save_path is not None:
-        print(f"SAVING W+B TO {save_path}")
-        torch.save(my_net.state_dict(), save_path)
-    print("DONE!")
+    factors = [1.0, 2.0, 4.0, 8.0, 16.0]
+    for f in factors:
+        nnfw.random_seed(10)
+        data_params["factor"] = f
+        if just_plot:
+            nnfw.plot_all(plot_params, general["prefix"])
+            break
+        nnfw.model_train_eval(general, data_params, hyp_params, plot_params)
+        nnfw.plot_all(plot_params, general["prefix"])
     return
 
 if __name__ == "__main__":
-    try:
-        script_name = os.path.basename(__file__)
-        load_name = os.path.splitext(script_name)[0]+".pth"
-        save_name = os.path.splitext(script_name)[0]+"_experiment.pth" 
-        print(f"RUNNING: {script_name}")
-        main(
-            epochs=100,
-            batch_sz=20,
-            lr=0.5,
-            hidden_lys=[200, 200],
-            do_test=True,
-            #load_path=load_name,
-            save_path=save_name
-        )
-    except KeyboardInterrupt:
-        print("\n\n---- interrupted! ----\n")
-        exit(0)
+    general = {
+        "title"     : "---",
+        "about"     : "---",
+        "prefix"    : "---",
+    }
+    data_params = {
+        "dataset"     : "mnist",
+        "factor"      : 1,
+        "augm_params" : {},
+        "export"      : 0,
+        "exp_dir"     : "augm_samples",
+    }
+    hyp_params = {
+        "device"      : "xpu",
+        "epochs"      : 200,
+        "batch_sz"    : 80,
+        "model"       : NeuralNetwork,
+        "hid_layers"  : [200, 200],
+        "load_path"   : None,
+        "model_fns"   : {"activ_hl" : nn.functional.relu,
+                         "loss"     : nn.functional.cross_entropy,
+                         "decision" : argmax},
+        "lrn_rate"    : 0.0005,
+        "w_decay"     : 0.0016,
+        "betas"       : (0.9, 0.999),
+        "dropout"     : 0.5,
+    }
+    plot_params = {
+        "keys_general" : ["title", "about"],
+        "keys_data"    : ["dataset", "train_sz"],
+        "keys_hparam"  : ["epochs", "batch_sz", "hid_layers", "lrn_rate",
+                          "w_decay", "dropout"],
+        "size"         : (10,8),
+        "x_range"      : "auto",
+        "y_range"      : (96, 100),
+        "plot_train"   : True,
+        "plot_valid"   : True,
+        "plot_test"    : True,
+    }
 
+    exp__weight_decay_dropout(general, data_params, hyp_params, plot_params,
+                              just_plot=False)
+    exp__augment_mnist(general, data_params, hyp_params, plot_params,
+                       just_plot=False)
+    exp__augment_cifar(general, data_params, hyp_params, plot_params,
+                       just_plot=False)
+
+    
