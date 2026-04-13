@@ -10,21 +10,19 @@ A learning project that intends to evolve from a simple neural network built fro
 
 
 ## Results
-| Dataset  | Fully Connected |
-|----------|-----------------|
-| MNIST    | **99.25%**      |
-| CIFAR-10 | **56.31%**      |
+| Dataset  | Fully Connected | Convolutional |
+|----------|-----------------|---------------|
+| MNIST    | **99.14%**      | **99.39%**    |
+| CIFAR-10 | **51.50%**      | **90.59%**    |
 
-### Weight decay and Dropout
-Regularization techniques, in general, disencourage complex models that rely on specific features, activations, or weights; in an attempt to avoid memorizing the training data (overfitting) and actually produce a model that is more general.
+### Fully Connected vs Convolutional models
+Convolutional networks take input images  with a given spatial size (image width/height) and a few channels (3 in RGB images). Typically, as the data goes trough the convolutions, the spatial size is reduced while new channels with more conceptual meanings are created. A fully connected "head" interprets the last activation map to take the final decision.
 
-In order to overfit the training data and see the effects of regularization, let's trim it to 5000 samples. With no weight decay or dropout (blue), training accuracy quickly  reaches 100% (thin line), but validation accuracy (thicker line) peak at 94.67% (star marker); resulting in the final test accuracy of 94.13% (triangle marker).
+Unlike fully connected networks, this architecture share weights across neurons of the same layer in the "kernel" patch. It also preserves spatial information that makes them much more suitable for image recognition tasks. The following plot shows a comparison between two networks with roughly the same number of parameters on CIFAR-10. One is Fully connected (blue) and the other is Convolutional (orange). The improvement is massive!
+![Fully Connected vs Convolutional on CIFAR-10 Dataset](img/802_fc_vs_cnn_on_cifar_plot.png)
 
-Each, weight decay and dropout help to reduce the gap between train and validation accuracy. But combined, they make the model generalize even better.
-
-![Weight Decay](img/701_SGD_weight-decay_plot.png)
-![Dropout](img/702_SGD_dropout_plot.png)
-![Weight Decay + Dropout](img/703_SGD_weight-decay-and-dropout_plot.png)
+MNIST is an easier dataset that reaches good accuracy with a fully connected network, however, a convolutional network of a similar number of parameters still shows some improvement.
+![Fully Connected vs Convolutional on MNIST Dataset](img/801_fc_vs_cnn_on_mnist_plot.png)
 
 ### Data augmentation
 Train data can be augmented by introducing small alterations to the original train dataset. Below, 9 input samples of MNIST and CIFAR-10 with some random alterations at their right. Made with the `kornia` python module.
@@ -35,70 +33,115 @@ Different augmentations make sense for different scenarios: in gray-scale charac
 The following plot shows the training of a fully connected network on MNIST, using AdamW with Cosine Annealing LR scheduling. Using only the original dataset of 50K samples yields a 98.66% accuracy (blue line). Augmenting the data improves accuracy; particularly, when augmented 16x, a 99.25% accuracy is obtained.
 ![Augmented Training on MNIST](img/711_mnist_augmentation_plot.png)
 
-Here is the same fully connected architecture training on CIFAR-10. The original dataset (50K - 5K validation samples) shows 48.98% test accuracy. A 16x data augmentation improves it to 56.31%. Although a convolutional model is a much better architecture for image classification, artificially augmenting the training data is a powerful tool.
+Here is the same fully connected architecture training on CIFAR-10. The original dataset (50K - 5K validation samples) shows 48.98% test accuracy. A 16x data augmentation improves it to 56.31%. Although a convolutional model is a much better architecture for image classification, artificially augmenting the training data is still a powerful tool.
 ![Augmented Training on CIFAR-10](img/721_cifar10_augmentation_plot.png)
 
+### Weight decay and Dropout
+Regularization techniques, in general, discourage complex models that rely on specific features, activations, or weights; in an attempt to avoid memorizing the training data (overfitting) and actually produce a model that is more general.
+
+In order to overfit the training data and see the effects of regularization, let's trim it to 5000 samples. With no weight decay or dropout (blue), training accuracy quickly  reaches 100% (thin line), but validation accuracy (thicker line) peak at 94.67% (star marker); resulting in the final test accuracy of 94.13% (triangle marker).
+
+Each, weight decay and dropout help to reduce the gap between train and validation accuracy. But combined, they make the model generalize even better.
+
+![Weight Decay](img/701_SGD_weight-decay_plot.png)
+![Dropout](img/702_SGD_dropout_plot.png)
+![Weight Decay + Dropout](img/703_SGD_weight-decay-and-dropout_plot.png)
+
 ## Running the code
-Place the `mnist.plk.gz` file at the root directory of this repo (you can get mnist [from here](https://github.com/mnielsen/neural-networks-and-deep-learning/raw/refs/heads/master/data/mnist.pkl.gz)), activate the conda environment (see [System Setup](#system-setup) section), and then run the main file.
+Activate the conda environment (see [System Setup](#system-setup) section), and then run the main file as a python module. Add the cli arguments `train` and `plot` to perform those actions.
 
 ``` shell
-$ ls mnist.pkl.gz
-mnist.pkl.gz
 $ conda activate torch-xpu
-$ python main.py 
+$ python -m nnfw.main train plot
 
-XPU AVAILABLE: True
+ACCELERATOR: XPU
 
-LOADING DATA: cifar-10
-Augmenting Dataset: 16.0x...............
-Training:(X,Y):
-    X    torch.float32   [720000, 3, 32, 32]
-    Y      torch.int32   [720000, 1]
-Validation:(X,Y):
-    X    torch.float32   [5000, 3, 32, 32]
-    Y      torch.int32   [5000, 1]
-Test:(X,Y):
-    X    torch.float32   [10000, 3, 32, 32]
-    Y      torch.int32   [10000, 1]
+LOADING DATA
+Dataset           : cifar-10 (60000 samples)
+Online augmenting : True
+Training:
+    samples  : 45000
+    batch_sz : 80
+    features : [3, 32, 32] torch.float32 
+    classes  : 10          <class 'int'> 
+Validation:
+    samples  : 5000
+    batch_sz : 1024
+    features : [3, 32, 32] torch.float32 
+    classes  : 10          <class 'int'> 
+Testing:
+    samples  : 10000
+    batch_sz : 1024
+    features : [3, 32, 32] torch.float32 
+    classes  : 10          <class 'int'> 
 
 CREATING MODEL
+  model        : ConvolutionalNet
+  epochs       : 200
+  batch_sz     : 80
+  dropout      : 0.5
+  lr           : 0.0005
+  lr_min       : 1e-06
+  w_decay      : 0.0016
+  betas        : (0.9, 0.999)
+  conv_cksp    : [(128, 3, 1, 2), (256, 3, 1, 2), (512, 3, 1, 2), (512, 3, 1, 2)]
+  head_hid_lys : [500, 200]
 
 TRAINING
-  epochs     : 200
-  batch_sz   : 80
-  hid_layers : [3000, 1000]
-  lrn_rate   : 0.0005
-  w_decay    : 0.0016
-  betas      : (0.9, 0.999)
-  dropout    : 0.5
-Epoch   1: tra: 41.77%   val: 41.25% <-- new best!
-Epoch   2: tra: 43.23%   val: 43.45% <-- new best!
-Epoch   3: tra: 43.43%   val: 45.08% <-- new best!
-Epoch   4: tra: 45.89%   val: 46.65% <-- new best!
-Epoch   5: tra: 44.98%   val: 45.48%
-Epoch   6: tra: 45.89%   val: 46.47%
-Epoch   7: tra: 46.09%   val: 47.44% <-- new best!
-Epoch   8: tra: 47.06%   val: 47.56% <-- new best!
+Epoch   1: tra: 55.66%   val: 52.88% <-- new best!
+Epoch   2: tra: 63.62%   val: 62.26% <-- new best!
+Epoch   3: tra: 71.42%   val: 68.66% <-- new best!
+Epoch   4: tra: 72.18%   val: 70.72% <-- new best!
+Epoch   5: tra: 77.42%   val: 74.60% <-- new best!
+Epoch   6: tra: 77.38%   val: 74.26%
+Epoch   7: tra: 79.34%   val: 76.24% <-- new best!
+Epoch   8: tra: 81.80%   val: 78.42% <-- new best!
 ...
-Epoch 170: tra: 59.46%   val: 57.74% <-- new best!
+Epoch 167: tra: 99.98%   val: 90.82% <-- new best!
 ...
-Epoch 192: tra: 59.58%   val: 57.46%
-Epoch 193: tra: 59.80%   val: 57.50%
-Epoch 194: tra: 59.74%   val: 57.34%
-Epoch 195: tra: 59.48%   val: 57.30%
-Epoch 196: tra: 59.74%   val: 57.32%
-Epoch 197: tra: 59.42%   val: 57.36%
-Epoch 198: tra: 59.54%   val: 57.42%
-Epoch 199: tra: 59.52%   val: 57.54%
-Epoch 200: tra: 59.44%   val: 57.36%
+Epoch 192: tra:100.00%   val: 90.26%
+Epoch 193: tra:100.00%   val: 90.56%
+Epoch 194: tra:100.00%   val: 90.50%
+Epoch 195: tra:100.00%   val: 90.34%
+Epoch 196: tra:100.00%   val: 90.34%
+Epoch 197: tra:100.00%   val: 90.52%
+Epoch 198: tra:100.00%   val: 90.36%
+Epoch 199: tra:100.00%   val: 90.50%
+Epoch 200: tra:100.00%   val: 90.54%
 
-SAVING PLOT DATA: plots/12_cifar10_augmentation_056.31__0411-142449.json
+SAVING PARAMS: results/802_fc_vs_cnn_on_cifar/090.59__0412-212148.params
 
-PLOTTING ALL 'plots/12_cifar10_augmentation_*.json' FILES.
+SAVING PLOT DATA: results/802_fc_vs_cnn_on_cifar/090.59__0412-212148.json
+
+PLOTTING ALL JSON FILES IN 'results/802_fc_vs_cnn_on_cifar'.
 ```
 
+To add more experiments, add new function definitions in [`nnfw/experiments/experiments.py`](nnfw/experiments/experiments.py), and add that function to the `list_of_experiments` in [`nnfw/main.py`](nnfw/main.py)
+
 ## Changelog Summary
-- Version 7.0.0:
+- Version 8.0.0:
+  - Replace static data augmentation with online augmentation (per batch) with no extra memory cost.
+  - Refactor code separating: data loaders, models, plotting, and experiments.
+    ```text
+    nnfw/
+    ├── dataloaders/
+    │   └── common.py
+    ├── experiments/
+    │   ├── util.py
+    │   └── experiments.py
+    ├── main.py
+    ├── models/
+    │   ├── cnn.py
+    │   ├── common.py
+    │   └── fc.py
+    ├── plotter.py
+    └── util.py
+    ```
+  - Add convolutional model in [`nnfw/models/cnn.py`](nnfw/models/cnn.py)
+  - Concentrate all experiments parameters in [`nnfw/experiments/experiments.py`](nnfw/experiments/experiments.py)
+  - Use PyTorch Data Loaders rather than manually handling the datasets from the `tar` files.
+
+- [Version 7.0.0](../../tree/v7.0.0):
   - Split code into `main.py` and `nnfw.py` (Neural Network framework)
   
   - **Activation function, regularization, and optimization loop**:
@@ -114,7 +157,7 @@ PLOTTING ALL 'plots/12_cifar10_augmentation_*.json' FILES.
     - `Loader._export_img()`: Original and Augmented images are exported and drawn side by side.
     
   - **Generalization of Data Loader and Model**:
-    - Generalize `Loader` class for common Loader interface and add `MnistLoader` and `CifarLoader` ([CIFAR-10](https://www.cs.toronto.edu/~kriz/cifar-10-python.tar.gz)) subclasses.
+     - Generalize `Loader` class for common Loader interface and add `MnistLoader` and `CifarLoader` ([CIFAR-10](https://www.cs.toronto.edu/~kriz/cifar-10-python.tar.gz)) subclasses.
     - Generalize neural network model class `Module(nn.Module)` so subclasses only need to implement an updated `__init__()`, `forward()` and `fit()`.
 
   - **Training monitoring and checkpoint**:
@@ -210,4 +253,27 @@ $ conda env create -f conda-environment.yml
 
 # activate it
 $ conda activate torch-xpu
+```
+
+That should be it! You can test your setup with this tiny python script:
+``` python
+import torch
+print("torch         :", torch.__version__)
+print("xpu available :", torch.xpu.is_available())
+print("device        :", torch.xpu.get_device_name(0))
+print("mem_get_info  :", torch.xpu.mem_get_info())
+
+x = torch.randn(1, device="xpu")
+torch.xpu.synchronize()
+y = x.cpu()
+print("x.cpu().item() =", y.item())
+```
+
+The output should look something like this (the last number is random)
+``` text
+torch         : 2.10.0+xpu
+xpu available : True
+device        : Intel(R) Graphics [0xe212]
+mem_get_info  : (9370324992, 16241180672)
+x.cpu().item() = 2.148054838180542
 ```
